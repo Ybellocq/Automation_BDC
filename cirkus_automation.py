@@ -4,6 +4,15 @@ import os
 from datetime import datetime
 import zipfile
 import xml.etree.ElementTree as ET
+import shutil
+
+# Installation requise : pip install openpyxl
+try:
+    from openpyxl import load_workbook, Workbook
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OPENPYXL_AVAILABLE = False
+    print("⚠️ openpyxl non installé. Installez-le avec : pip install openpyxl")
 
 class CirkusOrderAutomation:
     def __init__(self):
@@ -70,6 +79,18 @@ class CirkusOrderAutomation:
             'NOISETTE GOURMANDE - 10ML': 'NOISETTE GOURMANDE',
             'SAVAGE - 10ML': 'CLASSIC SAVAGE'
         }
+        
+        self.template_path = None
+
+    def set_template_path(self, template_path):
+        """Définit le chemin vers le template Excel"""
+        if os.path.exists(template_path):
+            self.template_path = template_path
+            print(f"✅ Template défini : {template_path}")
+            return True
+        else:
+            print(f"❌ Template non trouvé : {template_path}")
+            return False
 
     def read_excel_as_csv(self, file_path):
         """Lit un fichier Excel en le convertissant d'abord en CSV"""
@@ -79,15 +100,36 @@ class CirkusOrderAutomation:
                 print("❌ Le fichier doit être au format .xlsx")
                 return None
             
-            # Lire le fichier Excel manuellement (méthode basique)
-            return self.extract_xlsx_data(file_path)
+            # Essayer d'abord avec openpyxl si disponible
+            if OPENPYXL_AVAILABLE:
+                return self.read_excel_with_openpyxl(file_path)
+            else:
+                # Méthode de fallback
+                return self.extract_xlsx_data(file_path)
             
         except Exception as e:
             print(f"❌ Erreur lors de la lecture : {e}")
             return None
 
+    def read_excel_with_openpyxl(self, file_path):
+        """Lit un fichier Excel avec openpyxl"""
+        try:
+            workbook = load_workbook(file_path, data_only=True)
+            sheet = workbook.active
+            
+            data = []
+            for row in sheet.iter_rows(values_only=True):
+                data.append([str(cell) if cell is not None else '' for cell in row])
+            
+            workbook.close()
+            return data
+            
+        except Exception as e:
+            print(f"❌ Erreur openpyxl : {e}")
+            return None
+
     def extract_xlsx_data(self, file_path):
-        """Extrait les données d'un fichier XLSX sans openpyxl"""
+        """Extrait les données d'un fichier XLSX sans openpyxl (méthode de fallback)"""
         try:
             data = []
             
@@ -250,14 +292,131 @@ class CirkusOrderAutomation:
         """Retourne la liste des clients"""
         return list(clients_data.keys())
 
-    def create_order_form_csv(self, client_name, client_orders, output_dir="bons_commande"):
-        """Crée le bon de commande en CSV"""
+    def create_order_form_with_openpyxl(self, client_name, client_orders, output_dir="bons_commande"):
+        """Crée le bon de commande avec openpyxl (conserve le formatage)"""
+        if not OPENPYXL_AVAILABLE:
+            print("❌ openpyxl requis pour conserver le formatage Excel")
+            return self.create_order_form_csv(client_name, client_orders, output_dir)
+        
+        if not self.template_path or not os.path.exists(self.template_path):
+            print("❌ Template Excel non défini ou introuvable")
+            return self.create_order_form_csv(client_name, client_orders, output_dir)
+        
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
         
         # Créer le nom du fichier
         date_str = datetime.now().strftime("%Y%m%d")
-        filename = f"BON_COMMANDE_{client_name.replace(' ', '_').replace(',', '')}_{date_str}.csv"
+        filename = f"BON_COMMANDE_{client_name.replace(' ', '_').replace(',', '').replace('/', '_')}_{date_str}.xlsx"
+        filepath = os.path.join(output_dir, filename)
+        
+        try:
+            # Copier le template
+            shutil.copy2(self.template_path, filepath)
+            
+            # Ouvrir et modifier le fichier
+            workbook = load_workbook(filepath)
+            sheet = workbook.active
+            
+            # Variables pour le suivi
+            total_bottles = 0
+            client_updated = False
+            
+            # Parcourir toutes les cellules pour trouver les éléments à modifier
+            for row in sheet.iter_rows():
+                for cell in row:
+                    if cell.value is None:
+                        continue
+                    
+                    cell_value = str(cell.value).strip()
+                    
+                    # 1. Mise à jour du nom du client
+                    if not client_updated and (
+                        cell_value.upper() == 'CLIENT' or 
+                        'CLIENT' in cell_value.upper() or
+                        cell_value.upper() == 'NOM CLIENT' or
+                        'NOM' in cell_value.upper() and 'CLIENT' in cell_value.upper()
+                    ):
+                        # Chercher la cellule adjacente pour y mettre le nom
+                        next_cell = sheet.cell(row=cell.row, column=cell.column + 1)
+                        if next_cell.value is None or str(next_cell.value).strip() == '':
+                            next_cell.value = client_name
+                            client_updated = True
+                            print(f"✅ Client mis à jour : {client_name}")
+                    
+                    # 2. Mise à jour des quantités de produits
+                    for export_product, quantity in client_orders.items():
+                        if export_product in self.product_mapping:
+                            template_product = self.product_mapping[export_product]
+                            
+                            # Vérification flexible du nom du produit
+                            if (template_product.upper() in cell_value.upper() or 
+                                cell_value.upper() in template_product.upper() or
+                                self.fuzzy_match(cell_value, template_product)):
+                                
+                                # Chercher la cellule de quantité (généralement la suivante)
+                                qty_cell = sheet.cell(row=cell.row, column=cell.column + 1)
+                                if qty_cell.value is None or str(qty_cell.value).strip() in ['', '0']:
+                                    qty_cell.value = quantity
+                                    total_bottles += quantity
+                                    print(f"✅ {template_product}: {quantity}")
+                                break
+                    
+                    # 3. Mise à jour du total
+                    if ('TOTAL' in cell_value.upper() and 
+                        ('FLACON' in cell_value.upper() or 'BOUTEILLE' in cell_value.upper())):
+                        total_cell = sheet.cell(row=cell.row, column=cell.column + 1)
+                        total_cell.value = total_bottles
+                        print(f"✅ Total mis à jour : {total_bottles}")
+            
+            # Sauvegarder le fichier
+            workbook.save(filepath)
+            workbook.close()
+            
+            print(f"✅ Bon de commande Excel créé : {filepath}")
+            print(f"📦 Total flacons : {total_bottles}")
+            
+            return filepath
+            
+        except Exception as e:
+            print(f"❌ Erreur lors de la création avec openpyxl : {e}")
+            # Fallback vers CSV
+            return self.create_order_form_csv(client_name, client_orders, output_dir)
+
+    def fuzzy_match(self, str1, str2, threshold=0.8):
+        """Matching approximatif entre deux chaînes"""
+        str1 = str1.upper().strip()
+        str2 = str2.upper().strip()
+        
+        # Correspondance exacte
+        if str1 == str2:
+            return True
+        
+        # L'une contient l'autre
+        if str1 in str2 or str2 in str1:
+            return True
+        
+        # Calcul simple de similarité (Jaccard sur les mots)
+        words1 = set(str1.split())
+        words2 = set(str2.split())
+        
+        intersection = words1.intersection(words2)
+        union = words1.union(words2)
+        
+        if len(union) == 0:
+            return False
+        
+        similarity = len(intersection) / len(union)
+        return similarity >= threshold
+
+    def create_order_form_csv(self, client_name, client_orders, output_dir="bons_commande"):
+        """Crée le bon de commande en CSV (méthode de fallback)"""
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        
+        # Créer le nom du fichier
+        date_str = datetime.now().strftime("%Y%m%d")
+        filename = f"BON_COMMANDE_{client_name.replace(' ', '_').replace(',', '').replace('/', '_')}_{date_str}.csv"
         filepath = os.path.join(output_dir, filename)
         
         # Catégories et produits
@@ -299,7 +458,7 @@ class CirkusOrderAutomation:
                 
                 # Headers
                 headers = ['SAVEUR', '0mg', '3mg', '6mg', '9mg', 'New Taux', '12mg', 
-                          '16mg', 'SDN 10 mg', 'SDN 20 mg', 'PAB 50ML', 'AROMES 10mL', 'AROMES 30ml']
+                    '16mg', 'TOTAL', 'SDN 10 mg', 'SDN 20 mg', 'PAB 50ML', 'AROMES 10mL', 'AROMES 30ml']
                 writer.writerow(headers)
                 
                 # Catégories et produits
@@ -315,9 +474,10 @@ class CirkusOrderAutomation:
                         for export_product, quantity in client_orders.items():
                             if export_product in self.product_mapping:
                                 if self.product_mapping[export_product] == product:
-                                    row[1] = quantity  # Colonne 0mg
+                                    row[8] = quantity  # Colonne TOTAL (position 8)
                                     total_bottles += quantity
                                     break
+                                
                         
                         writer.writerow(row)
                 
@@ -331,19 +491,21 @@ class CirkusOrderAutomation:
             print(f"❌ Erreur lors de la création du CSV : {e}")
             return None
 
-    def process_client_order(self, sales_file, client_name):
+    def process_client_order(self, sales_file, client_name, clients_data=None):
         """Traite la commande complète pour un client"""
         print(f"🔄 Traitement de la commande pour : {client_name}")
         
-        # 1. Charger les données
-        raw_data = self.load_sales_data(sales_file)
-        if raw_data is None:
-            return None
-        
-        # 2. Parser les données
-        clients_data = self.parse_sales_data(raw_data)
+        # Si les données ne sont pas fournies, les charger
         if clients_data is None:
-            return None
+            # 1. Charger les données
+            raw_data = self.load_sales_data(sales_file)
+            if raw_data is None:
+                return None
+            
+            # 2. Parser les données
+            clients_data = self.parse_sales_data(raw_data)
+            if clients_data is None:
+                return None
         
         # 3. Vérifier si le client existe
         if client_name not in clients_data:
@@ -353,10 +515,57 @@ class CirkusOrderAutomation:
         client_orders = clients_data[client_name]
         print(f"📦 {len(client_orders)} produits trouvés pour {client_name}")
         
-        # 4. Créer le bon de commande
-        output_file = self.create_order_form_csv(client_name, client_orders)
+        # 4. Créer le bon de commande avec le template Excel si disponible
+        output_file = self.create_order_form_with_openpyxl(client_name, client_orders)
         
         return output_file
+
+    def parse_client_selection(self, selection, clients):
+        """Parse la sélection de clients (ex: "1,2,3" ou "1,4,6")"""
+        selected_clients = []
+        
+        # Diviser par les virgules et traiter chaque élément
+        parts = [part.strip() for part in selection.split(',')]
+        
+        for part in parts:
+            if part.isdigit():
+                idx = int(part) - 1
+                if 0 <= idx < len(clients):
+                    selected_clients.append(clients[idx])
+                else:
+                    print(f"⚠️ Numéro {part} invalide (max: {len(clients)})")
+            else:
+                # Recherche par nom
+                matches = [c for c in clients if part.upper() in c.upper()]
+                if len(matches) == 1:
+                    selected_clients.append(matches[0])
+                elif len(matches) > 1:
+                    print(f"🔍 Plusieurs clients trouvés pour '{part}' : {matches}")
+                else:
+                    print(f"❌ Client '{part}' non trouvé")
+        
+        return selected_clients
+
+    def process_multiple_orders(self, sales_file, selected_clients, clients_data):
+        """Traite les commandes pour plusieurs clients"""
+        print(f"\n🚀 Traitement de {len(selected_clients)} commandes...")
+        
+        created_files = []
+        errors = []
+        
+        for i, client_name in enumerate(selected_clients, 1):
+            print(f"\n--- [{i}/{len(selected_clients)}] {client_name} ---")
+            try:
+                output_file = self.process_client_order(sales_file, client_name, clients_data)
+                if output_file:
+                    created_files.append(output_file)
+                else:
+                    errors.append(client_name)
+            except Exception as e:
+                print(f"❌ Erreur pour {client_name}: {e}")
+                errors.append(client_name)
+        
+        return created_files, errors
 
 def main():
     """Fonction principale"""
@@ -364,8 +573,25 @@ def main():
     
     print("🎯 AUTOMATISATION BON DE COMMANDE CIRKUS")
     print("=" * 50)
+    
+    # Vérifier openpyxl
+    if not OPENPYXL_AVAILABLE:
+        print("⚠️ ATTENTION : openpyxl n'est pas installé !")
+        print("   Pour conserver le formatage Excel, installez-le avec :")
+        print("   pip install openpyxl")
+        print("")
+    
+    # Demander le template Excel
+    print("📋 ÉTAPE 1 : Template de bon de commande")
+    template_path = input("📁 Chemin vers votre template Excel (.xlsx) : ").strip().strip('"')
+    
+    if template_path and os.path.exists(template_path):
+        automation.set_template_path(template_path)
+    else:
+        print("⚠️ Template non trouvé, utilisation du format CSV par défaut")
+    
+    print("\n📊 ÉTAPE 2 : Fichier d'export des ventes")
     print("💡 Conseil : Exportez votre fichier Excel en CSV pour de meilleurs résultats")
-    print("")
     
     # Demander le fichier
     sales_file = input("📁 Chemin vers votre fichier d'export (.xlsx ou .csv) : ").strip().strip('"')
@@ -390,39 +616,36 @@ def main():
     for i, client in enumerate(clients, 1):
         print(f"{i:2d}. {client}")
     
-    # Choix du client
+    # Instructions pour la sélection
     print("\n" + "=" * 50)
-    choice = input("🎯 Entrez le numéro ou le nom du client : ").strip()
+    print("🎯 SÉLECTION DES CLIENTS :")
+    print("   • Un seul client : entrez le numéro (ex: 3)")
+    print("   • Plusieurs clients : séparez par des virgules (ex: 1,2,3 ou 1,4,6)")
+    print("   • Vous pouvez aussi utiliser les noms de clients")
+    print("   • Pour tous les clients : tapez 'all' ou 'tous'")
+    print("   • Pour quitter : tapez 'exit' ou 'quitter'")
     
-    # Déterminer le client choisi
-    selected_client = None
-    if choice.isdigit():
-        idx = int(choice) - 1
-        if 0 <= idx < len(clients):
-            selected_client = clients[idx]
+    # SUITE DE LA FONCTION main() :
+    
+    selection = input("\n🎯 Votre sélection : ").strip()
+    
+    # Traitement de la sélection
+    if selection.lower() in ['all', 'tous', 'tout']:
+        selected_clients = clients
     else:
-        # Recherche par nom
-        matches = [c for c in clients if choice.upper() in c.upper()]
-        if len(matches) == 1:
-            selected_client = matches[0]
-        elif len(matches) > 1:
-            print(f"🔍 Plusieurs clients trouvés : {matches}")
-            return
+        selected_clients = automation.parse_client_selection(selection, clients)
     
-    if selected_client is None:
-        print("❌ Client non trouvé !")
+    if not selected_clients:
+        print("❌ Aucun client sélectionné")
         return
     
-    # Traitement
-    print(f"\n🚀 Traitement en cours pour : {selected_client}")
-    output_file = automation.process_client_order(sales_file, selected_client)
+    # Traitement des commandes
+    created_files, errors = automation.process_multiple_orders(sales_file, selected_clients, clients_data)
     
-    if output_file:
-        print(f"\n✅ TERMINÉ ! Bon de commande créé : {output_file}")
-        print("📂 Le fichier CSV peut être ouvert dans Excel ou Numbers")
-        print("💡 Pour convertir en Excel : ouvrez le CSV et sauvegardez-le en .xlsx")
-    else:
-        print("❌ Erreur lors du traitement")
+    # Résultats
+    print(f"\n✅ {len(created_files)} bons de commande créés")
+    if errors:
+        print(f"❌ {len(errors)} erreurs : {errors}")
 
 if __name__ == "__main__":
     main()
