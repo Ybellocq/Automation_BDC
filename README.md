@@ -291,4 +291,4 @@ Modifiez la méthode `create_order_form_csv_enhanced()` pour adapter :
 **Version** : 2.0  
 **Dernière mise à jour** : Juin 2025 
 **Auteur** : [Yoann]  
-**Support** : [Yoann.bellocq@gmail.com]
+**Support** : [bellocq.yoann@gmail.com]
